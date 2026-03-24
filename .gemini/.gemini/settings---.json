@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "threejs": {
+      "timeout": 60000,
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/home/seele003/TTS/gamedevbench-bp",
+        "python",
+        "/home/seele003/TTS/gamedevbench-bp/gamedevbench/src/mcp_http_stdio_bridge.py",
+        "--url",
+        "http://127.0.0.1:6601/mcp"
+      ]
+    }
+  }
+}

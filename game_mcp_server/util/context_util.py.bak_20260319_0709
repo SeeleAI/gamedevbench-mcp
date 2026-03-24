@@ -1,0 +1,37 @@
+import logging
+from typing import Any, Optional
+
+from mcp.server.fastmcp import Context
+
+logger = logging.getLogger(__name__)
+
+
+def get_context_header_value(ctx: Context, key: Optional[str] = None) -> Any | None:
+    try:
+        meta = ctx.request_context.meta
+        if meta is None:
+            return None
+        if meta.model_extra is None:
+            return None
+        if key:
+            return meta.model_extra.get("headers", {}).get(key)
+        return meta.model_extra.get("headers", {})
+    except Exception as e:
+        logger.warning(f"Failed to get context header: {e}")
+        return None
+
+
+def get_context_canvas_id(ctx: Context) -> str:
+    return get_context_header_value(ctx, "x-canvas-id")
+
+
+def get_context_mcp_request_id(ctx: Context) -> str:
+    return get_context_header_value(ctx, "x-mcp-request-id")
+
+
+def get_context_x_thread_id(ctx: Context) -> str:
+    return get_context_header_value(ctx, "x-thread-id")
+
+
+def get_context_x_seele_canvas_trace_id(ctx: Context) -> str:
+    return get_context_header_value(ctx, "x-seele-canvas-trace-id")

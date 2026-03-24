@@ -1,0 +1,78 @@
+name: blender-mcp-server镜像构建，成功后在argocd上部署
+
+on:
+    workflow_dispatch:
+        inputs:
+            environment:
+                description: 'Select deployment environment'
+                required: true
+                type: choice
+                options:
+                    - test
+                    - prod
+                    - experiment
+
+jobs:
+    build-docker:
+        runs-on: ubuntu-22.04
+        env:
+            ENV_PROFILE: ${{ github.event.inputs.environment }}
+
+        steps:
+            - name: Validate branch and environment
+              if: |
+                  github.ref != 'refs/heads/master' &&
+                  github.event.inputs.environment == 'prod-1'
+              run: |
+                  echo "Error: Production deployment is only allowed from master branch!"
+                  exit 1
+            - name: env
+              id: vars
+              run: |
+                  IMAGE_NAME=blender-mcp-server
+                  FILE_TO_MODIFY=${ENV_PROFILE}/${IMAGE_NAME}/deploy.yaml       # 需要修改的文件路径
+
+                  ECR_REGISTRY=767398088105.dkr.ecr.ap-southeast-1.amazonaws.com
+                  TAG_NAME=${ENV_PROFILE}.${GITHUB_SHA::7}.$(date +'%Y%m%d%H%M%S')
+                  NEW_IMAGE_URL=${ECR_REGISTRY}/seeleai/${IMAGE_NAME}:${TAG_NAME}
+                  echo "NEW_IMAGE_URL=${NEW_IMAGE_URL}" >> $GITHUB_ENV
+                  echo "ECR_REGISTRY=${ECR_REGISTRY}" >> $GITHUB_ENV
+                  echo "FILE_TO_MODIFY=${FILE_TO_MODIFY}" >> $GITHUB_ENV
+                  cat $GITHUB_ENV
+
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Set up Docker Buildx
+              uses: docker/setup-buildx-action@v3
+
+            - name: Log in to ECR
+              uses: docker/login-action@v3
+              with:
+                  registry: ${{ env.ECR_REGISTRY }}
+                  username: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                  password: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+            - name: Build and push Docker image
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  push: true
+                  tags: ${{ env.NEW_IMAGE_URL }}
+
+            - name: Checkout private gitops repo
+              uses: actions/checkout@v4
+              with:
+                repository: SeeleAI/gitops-deploy
+                token: ${{ secrets.GITOPS_TOKEN }}
+                path: gitops-repo
+            - name: modify image url and push
+              run: |
+                  bash .github/scripts/git-push.sh \
+                    "${{ env.FILE_TO_MODIFY }}" \
+                    "${{ env.NEW_IMAGE_URL }}" \
+                    "${{ env.ENV_PROFILE }}" \
+                    "${{ github.repository }}" \
+                    "$(git log -1 --pretty=%B)" \
+                    "${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}" \
+                    "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

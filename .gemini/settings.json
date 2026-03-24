@@ -1,0 +1,31 @@
+{
+  "security": {
+    "auth": {
+      "selectedType": "vertex-ai"
+    }
+  },
+  "mcp": {
+    "allowed": [
+      "game"
+    ],
+    "excluded": [
+      "gamedevbench-mcp"
+    ]
+  },
+  "mcpServers": {
+    "game": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/home/seele003/TTS/gamedevbench-bp",
+        "python",
+        "/home/seele003/TTS/gamedevbench-bp/gamedevbench/src/mcp_http_stdio_bridge.py",
+        "--url",
+        "http://127.0.0.1:6601/mcp"
+      ],
+      "timeout": 60000
+    }
+  }
+}

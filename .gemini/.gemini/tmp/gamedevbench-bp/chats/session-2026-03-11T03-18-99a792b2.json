@@ -1,0 +1,19 @@
+{
+  "sessionId": "99a792b2-e5b3-44b8-8442-90893c3e44a9",
+  "projectHash": "afdc3dfd2e003f4cc71af5facb2f8dd1210c7e1173bac49189dbbdd46b84e246",
+  "startTime": "2026-03-11T03:18:52.895Z",
+  "lastUpdated": "2026-03-11T03:18:52.895Z",
+  "messages": [
+    {
+      "id": "a295f88c-30e5-40eb-b087-4c00f56716f5",
+      "timestamp": "2026-03-11T03:18:52.895Z",
+      "type": "user",
+      "content": [
+        {
+          "text": "Reply OK"
+        }
+      ]
+    }
+  ],
+  "kind": "main"
+}

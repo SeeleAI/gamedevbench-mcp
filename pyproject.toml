@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gamedevbench"
+version = "0.1.0"
+description = "A benchmark suite for game development tasks in Godot"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp",
+    "pyautogui",
+    "claude-code-sdk",
+    "pillow",
+    "openhands-sdk; python_version >= '3.12'",
+    "openhands-tools; python_version >= '3.12'",
+    "brokenaxes>=0.6.2",
+    "nacos-sdk-python>=3.0.4",
+    "python-http-cuda-rpc",
+]
+
+[project.scripts]
+gamedevbench = "gamedevbench.src.benchmark_runner:main"
+gamedevbench-mcp = "gamedevbench.src.mcp_server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-mock>=3.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["tasks*", "results*", "scripts*", "gamedevbench_*", "auto_task_generation*", "youtube_documentation*", "anna*", "templates*", "runs*"]
+
+[tool.uv.sources]
+python-http-cuda-rpc = { url = "https://seelemodel.oss-cn-hangzhou.aliyuncs.com/model/python_http_cuda_rpc/python_http_cuda_rpc-1.0.146-py3-none-any.whl" }

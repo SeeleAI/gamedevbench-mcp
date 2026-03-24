@@ -1,0 +1,20 @@
+{
+  "name": "html-bundler",
+  "version": "1.0.0",
+  "description": "HTML bundler for Three.js projects (integrated in game_mcp_server)",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "dev": "vite"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "vite": "^7.2.4",
+    "vite-plugin-singlefile": "^2.3.0"
+  }
+}
+
+
+

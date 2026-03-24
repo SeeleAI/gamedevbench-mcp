@@ -1,0 +1,417 @@
+"""
+HTTP client for threejs-env service.
+
+Encapsulates all interactions with the threejs-env service:
+session lifecycle, script CRUD, grep, runtime console, bundle, and playability test.
+
+When ``config.threejs.use_env`` is True the env service is the **sole** source of
+truth for workspace files.  There is no S3 fallback — if the env service is
+unreachable after one automatic retry the caller receives a clear error.
+
+Usage:
+    from util.env_client import env_client, EnvServiceUnavailableError
+"""
+import asyncio
+import logging
+from typing import Any, Dict, List, Optional, Tuple
+
+import aiohttp
+
+from config import config
+from util.context_util import get_context_canvas_id
+
+logger = logging.getLogger(__name__)
+
+RETRY_DELAY_S = 2.0
+RETRY_COUNT = 1
+
+
+class EnvServiceUnavailableError(Exception):
+    """Raised when the env service is unreachable or returns a non-recoverable error."""
+    pass
+
+
+class MissingContextCanvasIdError(Exception):
+    """Raised when env-backed MCP calls lack a run-scoped canvas id in request context."""
+    pass
+
+
+class _SessionLost(Exception):
+    """Internal: env returned 404 meaning the session was evicted or pod restarted."""
+    pass
+
+
+def build_session_id(canvas_id: str) -> str:
+    return canvas_id
+
+
+def _base_headers(canvas_id: str, session_id: str) -> Dict[str, str]:
+    headers = {
+        "x-canvas-id": canvas_id,
+        "x-session-id": session_id,
+    }
+    token = config.threejs.env_auth_token
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _url(path: str) -> str:
+    base = config.threejs.env_service_url.rstrip("/")
+    return f"{base}{path}"
+
+
+class EnvClient:
+    """Singleton HTTP client for threejs-env.  All methods are async."""
+
+    def __init__(self) -> None:
+        self._http: Optional[aiohttp.ClientSession] = None
+
+    # ------------------------------------------------------------------ #
+    # Shared HTTP session (connection-pooled)
+    # ------------------------------------------------------------------ #
+
+    def _get_http(self) -> aiohttp.ClientSession:
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession()
+        return self._http
+
+    async def close(self) -> None:
+        if self._http and not self._http.closed:
+            await self._http.close()
+            self._http = None
+
+    # ------------------------------------------------------------------ #
+    # Context helpers
+    # ------------------------------------------------------------------ #
+
+    def _ctx_ids(self, ctx) -> Tuple[str, str]:
+        """Return (canvas_id, session_id).  session_id == canvas_id."""
+        canvas_id = get_context_canvas_id(ctx)
+        if not canvas_id:
+            raise MissingContextCanvasIdError(
+                "missing_context_canvas_id: env-backed MCP call requires x-canvas-id in request context"
+            )
+        session_id = build_session_id(canvas_id)
+        return canvas_id, session_id
+
+    # ------------------------------------------------------------------ #
+    # Low-level HTTP helpers (with auto-retry)
+    # ------------------------------------------------------------------ #
+
+    async def _check_resp(self, resp: aiohttp.ClientResponse) -> None:
+        if resp.status == 404:
+            text = await resp.text()
+            raise _SessionLost(f"Session not found (404): {text[:200]}")
+        if resp.status >= 500:
+            text = await resp.text()
+            raise EnvServiceUnavailableError(
+                f"Env service error {resp.status}: {text[:200]}"
+            )
+        if resp.status >= 400:
+            text = await resp.text()
+            raise EnvServiceUnavailableError(
+                f"Env client error {resp.status}: {text[:200]}"
+            )
+
+    async def _raw_get(
+        self, url: str, headers: Dict, params: Optional[Dict], timeout: int,
+    ) -> Dict[str, Any]:
+        http = self._get_http()
+        async with http.get(
+            url, headers=headers, params=params,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            await self._check_resp(resp)
+            return await resp.json()
+
+    async def _raw_post(
+        self, url: str, headers: Dict, body: Dict, timeout: int,
+    ) -> Dict[str, Any]:
+        http = self._get_http()
+        async with http.post(
+            url, headers=headers, json=body,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            await self._check_resp(resp)
+            return await resp.json()
+
+    # ------------------------------------------------------------------ #
+    # Session management
+    # ------------------------------------------------------------------ #
+
+    async def _session_exists(self, canvas_id: str, session_id: str) -> bool:
+        try:
+            data = await self._raw_get(
+                _url("/env/session/status"),
+                _base_headers(canvas_id, session_id),
+                params=None, timeout=5,
+            )
+            exists = bool(data.get("exists"))
+            logger.debug("env: session_exists canvas=%s session=…%s → %s",
+                         canvas_id, session_id[-12:], exists)
+            return exists
+        except _SessionLost:
+            return False
+        except EnvServiceUnavailableError:
+            raise
+        except Exception as e:
+            raise EnvServiceUnavailableError(f"Cannot reach env service: {e}") from e
+
+    async def _init_session(self, canvas_id: str, session_id: str) -> None:
+        """Init session: env 自行从 S3 拉取画布和 skill 组件，只传 canvas_id。"""
+        try:
+            await self._raw_post(
+                _url("/env/session/init"),
+                _base_headers(canvas_id, session_id),
+                body={"canvas_id": canvas_id}, timeout=60,
+            )
+        except _SessionLost:
+            raise EnvServiceUnavailableError("Session init returned 404 unexpectedly")
+        except EnvServiceUnavailableError:
+            raise
+        except Exception as e:
+            raise EnvServiceUnavailableError(f"Session init failed: {e}") from e
+
+    async def _ensure_session(self, ctx, canvas_id: str, session_id: str) -> None:
+        """Check if session exists; if not, call init (env fetches from S3)."""
+        exists = await self._session_exists(canvas_id, session_id)
+        if not exists:
+            logger.info("env: session not found, init with canvas_id. canvas=%s session=…%s",
+                        canvas_id, session_id[-12:])
+            await self._init_session(canvas_id, session_id)
+            logger.info("env: init done. canvas=%s session=…%s", canvas_id, session_id[-12:])
+
+    # ------------------------------------------------------------------ #
+    # Public HTTP helpers — ensure_session + auto-retry on 404/_SessionLost
+    # ------------------------------------------------------------------ #
+
+    async def _post(
+        self, ctx, path: str, body: Dict[str, Any], timeout: int = 30,
+    ) -> Dict[str, Any]:
+        canvas_id, session_id = self._ctx_ids(ctx)
+        await self._ensure_session(ctx, canvas_id, session_id)
+
+        for attempt in range(1 + RETRY_COUNT):
+            try:
+                data = await self._raw_post(
+                    _url(path), _base_headers(canvas_id, session_id),
+                    body=body, timeout=timeout,
+                )
+                logger.debug("env: POST %s → success=%s", path, data.get("success"))
+                return data
+            except _SessionLost:
+                if attempt < RETRY_COUNT:
+                    logger.warning("env: POST %s got 404, rebuilding session (attempt %d)",
+                                   path, attempt + 1)
+                    await self._ensure_session(ctx, canvas_id, session_id)
+                    continue
+                raise EnvServiceUnavailableError(
+                    f"POST {path}: session lost after retry"
+                )
+            except EnvServiceUnavailableError:
+                if attempt < RETRY_COUNT:
+                    logger.warning("env: POST %s failed, retrying in %.1fs (attempt %d)",
+                                   path, RETRY_DELAY_S, attempt + 1)
+                    await asyncio.sleep(RETRY_DELAY_S)
+                    continue
+                raise
+            except Exception as e:
+                if attempt < RETRY_COUNT:
+                    logger.warning("env: POST %s error %s, retrying", path, e)
+                    await asyncio.sleep(RETRY_DELAY_S)
+                    continue
+                raise EnvServiceUnavailableError(f"POST {path} failed: {e}") from e
+        raise EnvServiceUnavailableError(f"POST {path}: exhausted retries")
+
+    async def _get(
+        self, ctx, path: str,
+        params: Optional[Dict[str, Any]] = None, timeout: int = 30,
+    ) -> Dict[str, Any]:
+        canvas_id, session_id = self._ctx_ids(ctx)
+        await self._ensure_session(ctx, canvas_id, session_id)
+
+        for attempt in range(1 + RETRY_COUNT):
+            try:
+                data = await self._raw_get(
+                    _url(path), _base_headers(canvas_id, session_id),
+                    params=params, timeout=timeout,
+                )
+                logger.debug("env: GET %s → success=%s", path, data.get("success"))
+                return data
+            except _SessionLost:
+                if attempt < RETRY_COUNT:
+                    logger.warning("env: GET %s got 404, rebuilding session (attempt %d)",
+                                   path, attempt + 1)
+                    await self._ensure_session(ctx, canvas_id, session_id)
+                    continue
+                raise EnvServiceUnavailableError(
+                    f"GET {path}: session lost after retry"
+                )
+            except EnvServiceUnavailableError:
+                if attempt < RETRY_COUNT:
+                    logger.warning("env: GET %s failed, retrying in %.1fs (attempt %d)",
+                                   path, RETRY_DELAY_S, attempt + 1)
+                    await asyncio.sleep(RETRY_DELAY_S)
+                    continue
+                raise
+            except Exception as e:
+                if attempt < RETRY_COUNT:
+                    logger.warning("env: GET %s error %s, retrying", path, e)
+                    await asyncio.sleep(RETRY_DELAY_S)
+                    continue
+                raise EnvServiceUnavailableError(f"GET {path} failed: {e}") from e
+        raise EnvServiceUnavailableError(f"GET {path}: exhausted retries")
+
+    # ------------------------------------------------------------------ #
+    # Script CRUD
+    # ------------------------------------------------------------------ #
+
+    async def scripts_create(self, ctx, script_name: str, code: str) -> Dict[str, Any]:
+        return await self._post(ctx, "/env/scripts/create",
+                                {"script_name": script_name, "code": code})
+
+    async def scripts_modify(
+        self, ctx, script_name: str, old_code: str, new_code: str,
+        fuzzy_mode: bool = False,
+    ) -> Dict[str, Any]:
+        """Read → local replace → write back."""
+        read_result = await self._get(ctx, "/env/scripts/read",
+                                      params={"script_name": script_name})
+        if not read_result.get("success"):
+            return {
+                "success": False,
+                "message": read_result.get("message", f"Script '{script_name}' not found"),
+            }
+
+        current_content: str = read_result.get("content", "")
+
+        if fuzzy_mode:
+            from util.fuzzy_replace import fuzzy_replace, FuzzyReplaceError, FuzzyReplaceAmbiguousError
+            try:
+                modified, matched_strategy = fuzzy_replace(current_content, old_code, new_code)
+            except FuzzyReplaceAmbiguousError as e:
+                return {"success": False, "message": str(e)}
+            except FuzzyReplaceError as e:
+                return {"success": False, "message": str(e)}
+        else:
+            count = current_content.count(old_code)
+            if count == 0:
+                return {"success": False, "message": f"Old code not found in script '{script_name}'"}
+            if count > 1:
+                return {
+                    "success": False,
+                    "message": (
+                        f"Old code appears {count} times in script '{script_name}'. "
+                        "It must appear exactly once."
+                    ),
+                }
+            modified = current_content.replace(old_code, new_code, 1)
+            matched_strategy = "exact"
+
+        result = await self._post(ctx, "/env/scripts/modify",
+                                  {"script_name": script_name, "code": modified})
+        if result.get("success"):
+            result["_modified_content"] = modified
+            result["_matched_strategy"] = matched_strategy
+        return result
+
+    async def scripts_rewrite(self, ctx, script_name: str, code: str) -> Dict[str, Any]:
+        return await self._post(ctx, "/env/scripts/modify",
+                                {"script_name": script_name, "code": code})
+
+    async def scripts_delete(self, ctx, script_name: str) -> Dict[str, Any]:
+        return await self._post(ctx, "/env/scripts/delete",
+                                {"script_name": script_name})
+
+    async def scripts_read(self, ctx, script_name: str) -> Dict[str, Any]:
+        return await self._get(ctx, "/env/scripts/read",
+                               params={"script_name": script_name})
+
+    async def scripts_list(self, ctx) -> Dict[str, Any]:
+        return await self._get(ctx, "/env/scripts/list")
+
+    async def fetch_all_files_as_dict(self, ctx) -> Dict[str, str]:
+        """Fetch all workspace files as {filename: content}.
+
+        Used by publish_game_version to create source snapshots.
+        """
+        list_result = await self.scripts_list(ctx)
+        if not list_result.get("success"):
+            logger.warning("fetch_all_files_as_dict: list failed")
+            return {}
+
+        files: Dict[str, str] = {}
+        for file_info in list_result.get("files", []):
+            name = file_info.get("file_name", "")
+            if not name:
+                continue
+            try:
+                read_result = await self.scripts_read(ctx, name)
+                if read_result.get("success"):
+                    files[name] = read_result.get("content", "")
+                else:
+                    logger.warning("fetch_all_files_as_dict: skip %s (%s)",
+                                   name, read_result.get("message"))
+            except Exception as e:
+                logger.warning("fetch_all_files_as_dict: skip %s (%s)", name, e)
+
+        logger.info("fetch_all_files_as_dict: fetched %d files", len(files))
+        return files
+
+    async def scripts_grep(self, ctx, pattern: str) -> Dict[str, Any]:
+        """Search across workspace files."""
+        raw = await self._post(ctx, "/env/scripts/grep", {"pattern": pattern})
+        if not raw.get("success"):
+            return raw
+        match_objects: List[Dict] = raw.get("matches", [])
+        match_strings = [
+            f"{m['file']}:{m['line']}: {m['content']}"
+            for m in match_objects if isinstance(m, dict)
+        ]
+        return {
+            "success": True,
+            "matches": match_strings,
+            "match_count": len(match_strings),
+        }
+
+    # ------------------------------------------------------------------ #
+    # Runtime
+    # ------------------------------------------------------------------ #
+
+    async def runtime_read_console(
+        self, ctx, lines: int = 10, console_type: str = "error",
+    ) -> Dict[str, Any]:
+        return await self._post(
+            ctx, "/env/runtime/read_console",
+            {"lines": lines, "console_type": console_type},
+            timeout=120,
+        )
+
+    async def runtime_run_playability_test(
+        self, ctx, test_script: str, timeout: int = 90,
+    ) -> Dict[str, Any]:
+        return await self._post(
+            ctx, "/env/runtime/run_playability_test",
+            {"test_script": test_script, "timeout": timeout},
+            timeout=timeout + 15,
+        )
+
+    # ------------------------------------------------------------------ #
+    # Bundle
+    # ------------------------------------------------------------------ #
+
+    async def bundle(self, ctx) -> Dict[str, Any]:
+        raw = await self._post(ctx, "/env/bundle", {}, timeout=120)
+        if not raw.get("success"):
+            return raw
+        files: Dict[str, str] = raw.get("files", {})
+        html_content = files.get("index.html", "")
+        return {
+            "success": bool(html_content),
+            "html_content": html_content,
+            "message": "" if html_content else "Bundle returned empty index.html",
+        }
+
+
+env_client = EnvClient()

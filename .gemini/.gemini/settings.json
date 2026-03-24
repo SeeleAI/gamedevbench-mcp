@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "game": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/home/seele003/TTS/gamedevbench-bp",
+        "python",
+        "/home/seele003/TTS/gamedevbench-bp/gamedevbench/src/mcp_http_stdio_bridge.py",
+        "--url",
+        "http://127.0.0.1:6601/mcp"
+      ],
+      "timeout": 60000,
+      "excludeTools": [
+        "read_console,publish_game_version,run_playability_test"
+      ],
+      "env": {
+        "GAMEDEVBENCH_RUN_CANVAS_ID": "b9cea7c3-61e5-41b4-b5ad-d4e5bb44c9c5",
+        "GAMEDEVBENCH_RUN_TRACE_ID": "b9cea7c3-61e5-41b4-b5ad-d4e5bb44c9c5|7d0551e5-df1b-4c49-8f07-a4784231637e|benchmark_task_0115|sandbox_sync"
+      }
+    }
+  }
+}
