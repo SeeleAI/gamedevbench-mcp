@@ -10,6 +10,7 @@ import yaml
 import tempfile
 import sys
 import uuid
+import hashlib
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -748,21 +749,131 @@ script = ExtResource("test_script")
 
         return sorted(set(rel_paths))
 
+    def _hash_file(self, path: Path) -> str:
+        """Compute a stable content hash for one file."""
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _build_snapshot_manifest(self, root_dir: Path) -> Dict[str, str]:
+        """Build a hash manifest for all managed files under one root."""
+        manifest: Dict[str, str] = {}
+        for abs_path, rel_path in self._iter_canvas_sync_files(root_dir):
+            manifest[rel_path] = self._hash_file(abs_path)
+        return manifest
+
+    def _download_canvas_to_temp(self, canvas_id: str) -> Path:
+        """Download the run-scoped remote canvas into a temporary directory."""
+        remote_dir = Path(tempfile.mkdtemp(prefix="gamedevbench_canvas_"))
+        s3_client, bucket_name, base_prefix = self._build_canvas_s3_client()
+        canvas_prefix = f"{base_prefix}/{canvas_id}/"
+
+        for rel_path in self._list_canvas_relative_paths(canvas_id):
+            local_path = remote_dir / rel_path
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            s3_client.download_file(
+                bucket_name,
+                f"{canvas_prefix}{rel_path}",
+                str(local_path),
+            )
+
+        return remote_dir
+
+    def _compute_file_level_merge(
+        self,
+        base_manifest: Dict[str, str],
+        local_manifest: Dict[str, str],
+        remote_manifest: Dict[str, str],
+    ) -> Dict[str, str]:
+        """Compute file-level three-way merge decisions."""
+        decisions: Dict[str, str] = {}
+        all_paths = sorted(
+            set(base_manifest) | set(local_manifest) | set(remote_manifest)
+        )
+
+        for rel_path in all_paths:
+            base_hash = base_manifest.get(rel_path)
+            local_hash = local_manifest.get(rel_path)
+            remote_hash = remote_manifest.get(rel_path)
+
+            if local_hash == remote_hash:
+                decisions[rel_path] = "noop"
+            elif local_hash == base_hash and remote_hash != base_hash:
+                decisions[rel_path] = "use_remote"
+            elif remote_hash == base_hash and local_hash != base_hash:
+                decisions[rel_path] = "keep_local"
+            elif base_hash is None and local_hash is not None and remote_hash is None:
+                decisions[rel_path] = "keep_local"
+            elif base_hash is None and remote_hash is not None and local_hash is None:
+                decisions[rel_path] = "use_remote"
+            elif local_hash is None and remote_hash == base_hash:
+                decisions[rel_path] = "keep_local"
+            elif remote_hash is None and local_hash == base_hash:
+                decisions[rel_path] = "keep_local"
+            else:
+                decisions[rel_path] = "conflict_keep_local"
+
+        return decisions
+
+    def _apply_merge_to_sandbox(
+        self,
+        sandbox_dir: Path,
+        remote_dir: Path,
+        decisions: Dict[str, str],
+    ) -> Dict[str, int]:
+        """Apply file-level merge decisions back into the sandbox."""
+        summary = {
+            "kept_local": 0,
+            "applied_remote": 0,
+            "conflicts": 0,
+            "noop": 0,
+        }
+
+        for rel_path, decision in decisions.items():
+            if decision == "use_remote":
+                remote_path = remote_dir / rel_path
+                local_path = sandbox_dir / rel_path
+                if not remote_path.exists():
+                    raise FileNotFoundError(
+                        f"Merge decision requested remote file but it was missing: {rel_path}"
+                    )
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(remote_path, local_path)
+                summary["applied_remote"] += 1
+            elif decision == "keep_local":
+                summary["kept_local"] += 1
+            elif decision == "conflict_keep_local":
+                summary["kept_local"] += 1
+                summary["conflicts"] += 1
+                if self.debug:
+                    print(f"      conflict_keep_local: {rel_path}")
+            else:
+                summary["noop"] += 1
+
+        return summary
+
+    @staticmethod
+    def _format_merge_summary(summary: Dict[str, int]) -> str:
+        """Format a compact merge summary for debug logs."""
+        return (
+            "three-way merge: "
+            f"applied_remote={summary['applied_remote']} "
+            f"kept_local={summary['kept_local']} "
+            f"conflicts={summary['conflicts']} "
+            f"noop={summary['noop']}"
+        )
+
     def _sync_canvas_to_sandbox(self, canvas_id: str, sandbox_dir: Path) -> None:
-        """Mirror run-scoped remote canvas files back into the local sandbox."""
+        """Mirror run-scoped remote canvas files back into the local sandbox.
+
+        Keep local-only files intact. Remote files still overwrite same-path local
+        files so MCP-authored updates remain authoritative on path conflicts.
+        """
         s3_client, bucket_name, base_prefix = self._build_canvas_s3_client()
         canvas_prefix = f"{base_prefix}/{canvas_id}/"
         remote_relpaths = self._list_canvas_relative_paths(canvas_id)
-        remote_relpath_set = set(remote_relpaths)
-
-        # Delete managed local files that were removed remotely.
-        local_relpath_set = {
-            rel_path for _, rel_path in self._iter_canvas_sync_files(sandbox_dir)
-        }
-        for rel_path in sorted(local_relpath_set - remote_relpath_set):
-            local_path = sandbox_dir / rel_path
-            if local_path.exists():
-                local_path.unlink()
 
         # Download remote files into the sandbox, overwriting stale local copies.
         for rel_path in remote_relpaths:
@@ -974,6 +1085,8 @@ script = ExtResource("test_script")
         display_model = self.model
         sandbox_dir = None
         validation_dir = None
+        base_manifest: Dict[str, str] = {}
+        remote_canvas_dir = None
 
         try:
             # Step 1: Create isolated sandbox environment in /tmp
@@ -1010,6 +1123,7 @@ script = ExtResource("test_script")
                     print(f"      Canvas ID: {run_canvas_id}")
                 try:
                     self._sync_sandbox_to_canvas(sandbox_dir, run_canvas_id)
+                    base_manifest = self._build_snapshot_manifest(sandbox_dir)
                 except Exception as e:
                     return {
                         "task_name": task_name,
@@ -1103,14 +1217,31 @@ script = ExtResource("test_script")
 
             if self.use_mcp and run_canvas_id and solver_result and solver_result.success:
                 if self.debug:
-                    print(f"[2.5/5] Syncing MCP canvas back to sandbox...")
+                    print(f"[2.5/5] Reconciling MCP canvas and sandbox...")
                 try:
-                    self._sync_canvas_to_sandbox(run_canvas_id, sandbox_dir)
+                    local_manifest = self._build_snapshot_manifest(sandbox_dir)
+                    remote_canvas_dir = self._download_canvas_to_temp(run_canvas_id)
+                    remote_manifest = self._build_snapshot_manifest(remote_canvas_dir)
+                    decisions = self._compute_file_level_merge(
+                        base_manifest,
+                        local_manifest,
+                        remote_manifest,
+                    )
+                    merge_summary = self._apply_merge_to_sandbox(
+                        sandbox_dir,
+                        remote_canvas_dir,
+                        decisions,
+                    )
+                    if self.debug:
+                        print(f"      Base manifest files: {len(base_manifest)}")
+                        print(f"      Local manifest files: {len(local_manifest)}")
+                        print(f"      Remote manifest files: {len(remote_manifest)}")
+                        print(f"      {self._format_merge_summary(merge_summary)}")
                 except Exception as e:
                     return {
                         "task_name": task_name,
                         "success": False,
-                        "message": f"Failed to sync MCP canvas back to sandbox: {e}",
+                        "message": f"Failed to reconcile MCP canvas back to sandbox: {e}",
                         "timestamp": datetime.now().isoformat(),
                         "agent": self.agent,
                         "model": display_model,
@@ -1220,6 +1351,15 @@ script = ExtResource("test_script")
                 except Exception as e:
                     if self.debug:
                         print(f"  Warning: Could not clean up sandbox: {e}")
+
+            if remote_canvas_dir and remote_canvas_dir.exists():
+                try:
+                    shutil.rmtree(remote_canvas_dir)
+                    if self.debug:
+                        print(f"  Cleaned up remote canvas dir: {remote_canvas_dir}")
+                except Exception as e:
+                    if self.debug:
+                        print(f"  Warning: Could not clean up remote canvas dir: {e}")
 
             if validation_dir and validation_dir.exists():
                 try:

@@ -276,3 +276,9 @@ software-agent-sdk
 
 # seeles-test-service-account.json
 seeles-test-service-account.json
+
+.gemini/.gemini/history/
+.gemini/.gemini/tmp/
+
+game_mcp_server/config.py
+game_mcp_server/llm/openai_config.py

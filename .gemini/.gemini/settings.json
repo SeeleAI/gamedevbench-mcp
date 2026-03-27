@@ -5,9 +5,9 @@
       "args": [
         "run",
         "--directory",
-        "/home/seele003/TTS/gamedevbench-bp",
+        "/home/seele003/TTS/gamedevbench-mcp",
         "python",
-        "/home/seele003/TTS/gamedevbench-bp/gamedevbench/src/mcp_http_stdio_bridge.py",
+        "/home/seele003/TTS/gamedevbench-mcp/gamedevbench/src/mcp_http_stdio_bridge.py",
         "--url",
         "http://127.0.0.1:6601/mcp"
       ],
@@ -16,8 +16,8 @@
         "read_console,publish_game_version,run_playability_test"
       ],
       "env": {
-        "GAMEDEVBENCH_RUN_CANVAS_ID": "b9cea7c3-61e5-41b4-b5ad-d4e5bb44c9c5",
-        "GAMEDEVBENCH_RUN_TRACE_ID": "b9cea7c3-61e5-41b4-b5ad-d4e5bb44c9c5|7d0551e5-df1b-4c49-8f07-a4784231637e|benchmark_task_0115|sandbox_sync"
+        "GAMEDEVBENCH_RUN_CANVAS_ID": "e7b3ff6d-15cf-4c66-8bb9-77a6a87aa32f",
+        "GAMEDEVBENCH_RUN_TRACE_ID": "e7b3ff6d-15cf-4c66-8bb9-77a6a87aa32f|2604c0a9-dc55-426f-a8d8-f3f68b9b1493|benchmark_task_0115|sandbox_sync"
       }
     }
   }
